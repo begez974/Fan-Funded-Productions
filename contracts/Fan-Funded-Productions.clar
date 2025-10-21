@@ -20,10 +20,15 @@
 (define-constant ERR_MILESTONE_NOT_FOUND (err u109))
 (define-constant ERR_MILESTONE_COMPLETED (err u110))
 (define-constant ERR_INSUFFICIENT_VOTES (err u111))
+(define-constant ERR_REWARD_NOT_FOUND (err u112))
+(define-constant ERR_REWARD_ALREADY_CLAIMED (err u113))
+(define-constant ERR_INSUFFICIENT_CONTRIBUTION (err u114))
+(define-constant ERR_REWARD_LIMIT_REACHED (err u115))
 
 (define-data-var next-campaign-id uint u1)
 (define-data-var next-milestone-id uint u1)
 (define-data-var total-revenue uint u0)
+(define-data-var next-reward-tier-id uint u1)
 
 (define-map campaigns 
   uint 
@@ -70,6 +75,36 @@
 (define-map campaign-milestones
   uint
   (list 10 uint)
+)
+
+(define-map reward-tiers
+  uint
+  {
+    campaign-id: uint,
+    tier-name: (string-ascii 64),
+    description: (string-ascii 256),
+    min-contribution: uint,
+    max-backers: uint,
+    current-backers: uint,
+    reward-details: (string-ascii 256),
+    delivery-estimate: uint,
+    is-active: bool
+  }
+)
+
+(define-map campaign-reward-tiers
+  uint
+  (list 10 uint)
+)
+
+(define-map reward-claims
+  {tier-id: uint, backer: principal}
+  {
+    claimed: bool,
+    claim-block: uint,
+    fulfilled: bool,
+    fulfillment-block: (optional uint)
+  }
 )
 
 (define-public (get-name)
@@ -502,4 +537,179 @@
     total-tokens: (ft-get-balance production-token backer),
     campaigns-backed: (len (default-to (list) (map-get? user-campaigns backer)))
   })
+)
+
+(define-public (create-reward-tier
+  (campaign-id uint)
+  (tier-name (string-ascii 64))
+  (description (string-ascii 256))
+  (min-contribution uint)
+  (max-backers uint)
+  (reward-details (string-ascii 256))
+  (delivery-estimate uint)
+)
+  (let
+    (
+      (campaign (unwrap! (map-get? campaigns campaign-id) ERR_CAMPAIGN_NOT_FOUND))
+      (tier-id (var-get next-reward-tier-id))
+      (existing-tiers (default-to (list) (map-get? campaign-reward-tiers campaign-id)))
+    )
+    (asserts! (is-eq tx-sender (get creator campaign)) ERR_UNAUTHORIZED)
+    (asserts! (get is-active campaign) ERR_CAMPAIGN_ENDED)
+    (asserts! (> min-contribution u0) ERR_INVALID_AMOUNT)
+    (asserts! (> max-backers u0) ERR_INVALID_AMOUNT)
+    (asserts! (> (len tier-name) u0) ERR_INVALID_AMOUNT)
+    
+    (map-set reward-tiers tier-id {
+      campaign-id: campaign-id,
+      tier-name: tier-name,
+      description: description,
+      min-contribution: min-contribution,
+      max-backers: max-backers,
+      current-backers: u0,
+      reward-details: reward-details,
+      delivery-estimate: delivery-estimate,
+      is-active: true
+    })
+    
+    (map-set campaign-reward-tiers campaign-id
+      (unwrap! (as-max-len? (append existing-tiers tier-id) u10) ERR_INVALID_AMOUNT)
+    )
+    
+    (var-set next-reward-tier-id (+ tier-id u1))
+    (ok tier-id)
+  )
+)
+
+(define-public (claim-reward-tier (tier-id uint))
+  (let
+    (
+      (tier (unwrap! (map-get? reward-tiers tier-id) ERR_REWARD_NOT_FOUND))
+      (campaign (unwrap! (map-get? campaigns (get campaign-id tier)) ERR_CAMPAIGN_NOT_FOUND))
+      (backer-key {campaign-id: (get campaign-id tier), backer: tx-sender})
+      (backing (unwrap! (map-get? campaign-backers backer-key) ERR_UNAUTHORIZED))
+      (claim-key {tier-id: tier-id, backer: tx-sender})
+      (existing-claim (map-get? reward-claims claim-key))
+    )
+    (asserts! (is-none existing-claim) ERR_REWARD_ALREADY_CLAIMED)
+    (asserts! (get is-active tier) ERR_REWARD_NOT_FOUND)
+    (asserts! (>= (get amount backing) (get min-contribution tier)) ERR_INSUFFICIENT_CONTRIBUTION)
+    (asserts! (< (get current-backers tier) (get max-backers tier)) ERR_REWARD_LIMIT_REACHED)
+    
+    (map-set reward-claims claim-key {
+      claimed: true,
+      claim-block: stacks-block-height,
+      fulfilled: false,
+      fulfillment-block: none
+    })
+    
+    (map-set reward-tiers tier-id (merge tier {
+      current-backers: (+ (get current-backers tier) u1)
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (mark-reward-fulfilled (tier-id uint) (backer principal))
+  (let
+    (
+      (tier (unwrap! (map-get? reward-tiers tier-id) ERR_REWARD_NOT_FOUND))
+      (campaign (unwrap! (map-get? campaigns (get campaign-id tier)) ERR_CAMPAIGN_NOT_FOUND))
+      (claim-key {tier-id: tier-id, backer: backer})
+      (claim (unwrap! (map-get? reward-claims claim-key) ERR_REWARD_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator campaign)) ERR_UNAUTHORIZED)
+    (asserts! (get claimed claim) ERR_REWARD_NOT_FOUND)
+    (asserts! (not (get fulfilled claim)) ERR_REWARD_ALREADY_CLAIMED)
+    
+    (map-set reward-claims claim-key (merge claim {
+      fulfilled: true,
+      fulfillment-block: (some stacks-block-height)
+    }))
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-reward-tier (tier-id uint))
+  (let
+    (
+      (tier (unwrap! (map-get? reward-tiers tier-id) ERR_REWARD_NOT_FOUND))
+      (campaign (unwrap! (map-get? campaigns (get campaign-id tier)) ERR_CAMPAIGN_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get creator campaign)) ERR_UNAUTHORIZED)
+    
+    (map-set reward-tiers tier-id (merge tier {is-active: false}))
+    (ok true)
+  )
+)
+
+(define-read-only (get-reward-tier (tier-id uint))
+  (map-get? reward-tiers tier-id)
+)
+
+(define-read-only (get-campaign-reward-tiers (campaign-id uint))
+  (default-to (list) (map-get? campaign-reward-tiers campaign-id))
+)
+
+(define-read-only (get-reward-claim (tier-id uint) (backer principal))
+  (map-get? reward-claims {tier-id: tier-id, backer: backer})
+)
+
+(define-read-only (check-reward-eligibility (tier-id uint) (backer principal))
+  (match (map-get? reward-tiers tier-id)
+    tier
+      (match (map-get? campaigns (get campaign-id tier))
+        campaign
+          (match (map-get? campaign-backers {campaign-id: (get campaign-id tier), backer: backer})
+            backing
+              (let
+                (
+                  (already-claimed (is-some (map-get? reward-claims {tier-id: tier-id, backer: backer})))
+                  (meets-minimum (>= (get amount backing) (get min-contribution tier)))
+                  (tier-available (< (get current-backers tier) (get max-backers tier)))
+                )
+                (ok {
+                  eligible: (and (not already-claimed) meets-minimum tier-available (get is-active tier)),
+                  already-claimed: already-claimed,
+                  meets-minimum: meets-minimum,
+                  tier-available: tier-available,
+                  tier-active: (get is-active tier)
+                })
+              )
+            ERR_UNAUTHORIZED
+          )
+        ERR_CAMPAIGN_NOT_FOUND
+      )
+    ERR_REWARD_NOT_FOUND
+  )
+)
+
+(define-read-only (get-tier-availability (tier-id uint))
+  (match (map-get? reward-tiers tier-id)
+    tier (ok {
+      total-slots: (get max-backers tier),
+      filled-slots: (get current-backers tier),
+      available-slots: (- (get max-backers tier) (get current-backers tier)),
+      is-full: (>= (get current-backers tier) (get max-backers tier))
+    })
+    ERR_REWARD_NOT_FOUND
+  )
+)
+
+(define-read-only (get-backer-rewards (campaign-id uint) (backer principal))
+  (let
+    (
+      (tier-ids (get-campaign-reward-tiers campaign-id))
+    )
+    (ok (map get-reward-status-for-backer tier-ids))
+  )
+)
+
+(define-private (get-reward-status-for-backer (tier-id uint))
+  {
+    tier-id: tier-id,
+    claimed: (is-some (map-get? reward-claims {tier-id: tier-id, backer: tx-sender}))
+  }
 )
